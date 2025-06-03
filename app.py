@@ -3,7 +3,7 @@ import time
 import base64
 import json
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Body, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -14,795 +14,614 @@ import uvicorn
 from io import BytesIO
 from starlette.responses import JSONResponse
 from dotenv import load_dotenv
-import boto3
-from botocore.exceptions import ClientError
+import firebase_admin
+from firebase_admin import credentials, firestore, storage
+from gradio_client import Client, file
+import tempfile
 import pandas as pd
+from PIL import Image
+import numpy as np
 
-# Load environment variables from .env file
+# Load environment variables
 load_dotenv()
 
-app = FastAPI(title="Enhanced Shopping Assistant API", description="API for shopping assistant, virtual try-on, wardrobe analytics, and weather-based recommendations")
+app = FastAPI(title="Enhanced Shopping Assistant API with Firebase", 
+              description="Complete shopping assistant with Firebase integration, virtual try-on, and AI recommendations")
 
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# Get API keys from environment variables
+# Environment Variables
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
-GOOGLE_SHOPPING_REGION = os.getenv("GOOGLE_SHOPPING_REGION", "CH")  # Default to CH if not specified
-WEATHER_API_KEY = os.getenv("WEATHER_API_KEY")  # Weather API key
+WEATHER_API_KEY = os.getenv("WEATHER_API_KEY")
+FIREBASE_SERVICE_ACCOUNT_PATH = os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH", "serviceAccountKey.json")
+FIREBASE_STORAGE_BUCKET = os.getenv("FIREBASE_STORAGE_BUCKET")
 
-# AWS S3 Configuration
-AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
-AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
-S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
+# Initialize Firebase
+try:
+    cred = credentials.Certificate(FIREBASE_SERVICE_ACCOUNT_PATH)
+    firebase_admin.initialize_app(cred, {
+        'storageBucket': FIREBASE_STORAGE_BUCKET
+    })
+    db = firestore.client()
+    bucket = storage.bucket()
+    print("Firebase initialized successfully")
+except Exception as e:
+    print(f"Firebase initialization error: {e}")
+    # For development, create mock objects
+    db = None
+    bucket = None
 
-# OpenAI client setup
-shopper_assistant_client = OpenAI(api_key=OPENAI_API_KEY)
+# OpenAI client
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-# AWS S3 client setup
-s3_client = boto3.client(
-    's3',
-    aws_access_key_id=AWS_ACCESS_KEY_ID,
-    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-    region_name=AWS_REGION
-)
+# Gradio clients for various AI services
+try:
+    tryon_client = Client("yisol/IDM-VTON")
+    print("Virtual try-on client initialized")
+except Exception as e:
+    print(f"Try-on client initialization error: {e}")
+    tryon_client = None
 
-# DynamoDB client for metadata if needed
-dynamodb_client = boto3.resource(
-    'dynamodb',
-    aws_access_key_id=AWS_ACCESS_KEY_ID,
-    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-    region_name=AWS_REGION
-)
-
-# Create shopping assistant
-shopping_assistant = shopper_assistant_client.beta.assistants.create(
-    name="Shopping Guide",
-    instructions="""As a Shopping Guide, you assist users in making informed purchasing decisions. 
-    You ask about their preferences, budget, and the type of product they are looking for, offering options that best match their criteria. 
-    You provide comparisons between products, highlighting features, advantages, and disadvantages. 
-    You are knowledgeable about a wide range of products and provide guidance on choosing the best option according to the user's needs. 
-    You also consider weather conditions when recommending clothing and other weather-sensitive items. 
-    You maintain a friendly and helpful tone, ensuring the user feels supported throughout their decision-making process. 
-    Avoid suggesting products outside the user's budget or preferences. 
-    Instead, focus on finding the best fit within their specified parameters.""",
-    model="gpt-4-1106-preview",
-    tools=[
-        {
-            "type": "function",
-            "function": {
-                "name": "search_google_shopping",
-                "description": "Retrieve Google Shopping search results for a given query.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "The search query for finding products on Google Shopping."
-                    }
-                    },
-                    "required": ["query"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "get_weather_forecast",
-                "description": "Get weather forecast for a location to suggest appropriate products.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "location": {
-                            "type": "string",
-                            "description": "The city or location for weather forecast."
-                        }
-                    },
-                    "required": ["location"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "get_user_wardrobe_items",
-                "description": "Retrieve wardrobe items for a user to make recommendations.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "user_id": {
-                            "type": "string",
-                            "description": "The user ID to retrieve wardrobe data for."
-                        },
-                        "category": {
-                            "type": "string",
-                            "description": "Optional category to filter (tops, bottoms, dresses, etc.)",
-                            "default": "all"
-                        }
-                    },
-                    "required": ["user_id"]
-                }
-            }
-        }
-    ]
-)
-
-# Thread storage - in a production environment, use a database
-thread_storage = {}
-
-# Define data models
+# Data Models
 class ChatMessage(BaseModel):
     message: str
+    user_id: str
     thread_id: Optional[str] = None
-    user_id: str
-
-class TryOnRequest(BaseModel):
-    garment_type: str
-    sleeve_length: str
-    garment_length: str
-    user_id: str
 
 class WardrobeItem(BaseModel):
-    item_type: str
+    item_type: str  # tops, bottoms, dresses, shoes, accessories
     color: str
     brand: Optional[str] = None
-    season: Optional[str] = None
+    season: Optional[str] = None  # spring, summer, fall, winter
     style: Optional[str] = None
     material: Optional[str] = None
-    occasion: Optional[str] = None
+    occasion: Optional[str] = None  # casual, formal, business, party
+    description: Optional[str] = None
+    price: Optional[float] = None
+    purchase_date: Optional[str] = None
 
-class UserLocation(BaseModel):
-    user_id: str
-    location: str
+class OutfitPlan(BaseModel):
+    name: str
+    occasion: str
+    weather_condition: Optional[str] = None
+    items: List[str]  # List of item IDs
+    date_planned: Optional[str] = None
 
-# S3 Utility Functions
-def save_to_s3(data, key_path, content_type="application/json"):
-    """Save data to S3 bucket with specified key path"""
+class UserPreferences(BaseModel):
+    preferred_colors: List[str] = []
+    preferred_brands: List[str] = []
+    preferred_styles: List[str] = []
+    size_info: Dict[str, str] = {}
+    budget_range: Dict[str, float] = {}
+
+class TryOnRequest(BaseModel):
+    person_image_url: str
+    garment_image_url: str
+    garment_description: str
+
+# Firebase Helper Functions
+def save_to_firestore(collection: str, document_id: str, data: dict):
+    """Save data to Firestore"""
     try:
-        if isinstance(data, (dict, list)):
-            data = json.dumps(data)
-            
-        s3_client.put_object(
-            Bucket=S3_BUCKET_NAME,
-            Key=key_path,
-            Body=data,
-            ContentType=content_type
-        )
-        return f"s3://{S3_BUCKET_NAME}/{key_path}"
-    except ClientError as e:
-        print(f"Error saving to S3: {e}")
+        if db:
+            db.collection(collection).document(document_id).set(data, merge=True)
+            return True
+        return False
+    except Exception as e:
+        print(f"Error saving to Firestore: {e}")
+        return False
+
+def get_from_firestore(collection: str, document_id: str):
+    """Get data from Firestore"""
+    try:
+        if db:
+            doc = db.collection(collection).document(document_id).get()
+            return doc.to_dict() if doc.exists else None
+        return None
+    except Exception as e:
+        print(f"Error getting from Firestore: {e}")
         return None
 
-def get_from_s3(key_path):
-    """Get data from S3 bucket with specified key path"""
+def query_firestore(collection: str, filters: List = None):
+    """Query Firestore collection with optional filters"""
     try:
-        response = s3_client.get_object(
-            Bucket=S3_BUCKET_NAME,
-            Key=key_path
-        )
-        data = response['Body'].read()
-        return data
-    except ClientError as e:
-        print(f"Error getting from S3: {e}")
-        return None
-
-def list_s3_objects(prefix):
-    """List objects in S3 bucket with specified prefix"""
-    try:
-        response = s3_client.list_objects_v2(
-            Bucket=S3_BUCKET_NAME,
-            Prefix=prefix
-        )
-        return [item['Key'] for item in response.get('Contents', [])]
-    except ClientError as e:
-        print(f"Error listing S3 objects: {e}")
+        if db:
+            query = db.collection(collection)
+            if filters:
+                for field, operator, value in filters:
+                    query = query.where(field, operator, value)
+            return [doc.to_dict() for doc in query.stream()]
+        return []
+    except Exception as e:
+        print(f"Error querying Firestore: {e}")
         return []
 
-def save_chat_history(user_id, thread_id, message, role="user"):
-    """Save chat message to S3"""
-    timestamp = datetime.now().isoformat()
-    chat_data = {
-        "user_id": user_id,
-        "thread_id": thread_id,
-        "message": message,
-        "role": role,
-        "timestamp": timestamp
-    }
-    
-    key_path = f"chats/{user_id}/{thread_id}/{timestamp}.json"
-    return save_to_s3(chat_data, key_path)
-
-def save_image_to_s3(user_id, image_data, image_type="product"):
-    """Save image to S3 bucket"""
-    timestamp = datetime.now().isoformat()
-    image_id = str(uuid.uuid4())
-    key_path = f"images/{user_id}/{image_type}/{image_id}.jpg"
-    
+def upload_to_firebase_storage(file_data, file_path: str):
+    """Upload file to Firebase Storage"""
     try:
-        s3_client.put_object(
-            Bucket=S3_BUCKET_NAME,
-            Key=key_path,
-            Body=image_data,
-            ContentType="image/jpeg"
-        )
-        return key_path
-    except ClientError as e:
-        print(f"Error saving image to S3: {e}")
+        if bucket:
+            blob = bucket.blob(file_path)
+            blob.upload_from_string(file_data, content_type='image/jpeg')
+            blob.make_public()
+            return blob.public_url
+        return None
+    except Exception as e:
+        print(f"Error uploading to Firebase Storage: {e}")
         return None
 
-def save_wardrobe_item(user_id, item_data, image=None):
-    """Save wardrobe item data and image to S3"""
-    item_id = str(uuid.uuid4())
-    timestamp = datetime.now().isoformat()
-    
-    # Add metadata
-    item_data["item_id"] = item_id
-    item_data["timestamp"] = timestamp
-    
-    # Save item data
-    data_key_path = f"wardrobe/{user_id}/items/{item_id}.json"
-    data_url = save_to_s3(item_data, data_key_path)
-    
-    # Save image if provided
-    image_key_path = None
-    if image:
-        image_key_path = f"wardrobe/{user_id}/images/{item_id}.jpg"
-        s3_client.put_object(
-            Bucket=S3_BUCKET_NAME,
-            Key=image_key_path,
-            Body=image,
-            ContentType="image/jpeg"
-        )
-        
-    return {
-        "item_id": item_id,
-        "data_path": data_key_path,
-        "image_path": image_key_path
-    }
-
-def get_wardrobe_items(user_id, category="all"):
-    """Get wardrobe items for a user, optionally filtered by category"""
-    prefix = f"wardrobe/{user_id}/items/"
-    item_keys = list_s3_objects(prefix)
-    
-    items = []
-    for key in item_keys:
-        try:
-            item_data = get_from_s3(key)
-            if item_data:
-                item_json = json.loads(item_data)
-                if category == "all" or item_json.get("item_type") == category:
-                    # Add image URL if available
-                    item_id = item_json.get("item_id")
-                    image_key = f"wardrobe/{user_id}/images/{item_id}.jpg"
-                    item_json["image_url"] = f"https://{S3_BUCKET_NAME}.s3.amazonaws.com/{image_key}"
-                    items.append(item_json)
-        except Exception as e:
-            print(f"Error processing item {key}: {e}")
-    
-    return items
-
-# Weather API Functions
-def get_weather(location):
-    """Get current weather data for a location"""
-    base_url = "https://api.openweathermap.org/data/2.5/weather"
-    params = {
-        "q": location,
-        "appid": WEATHER_API_KEY,
-        "units": "metric"  # Use metric units
-    }
-    
+def download_from_firebase_storage(file_path: str):
+    """Download file from Firebase Storage"""
     try:
-        response = requests.get(base_url, params=params)
-        response.raise_for_status()
-        return response.json()
-    except requests.RequestException as e:
-        print(f"Weather API error: {e}")
-        return {"error": "Failed to retrieve weather data"}
-
-def get_weather_forecast(location):
-    """Get 5-day weather forecast for a location"""
-    base_url = "https://api.openweathermap.org/data/2.5/forecast"
-    params = {
-        "q": location,
-        "appid": WEATHER_API_KEY,
-        "units": "metric"  # Use metric units
-    }
-    
-    try:
-        response = requests.get(base_url, params=params)
-        response.raise_for_status()
-        data = response.json()
-        
-        # Process the forecast data to make it more readable
-        simplified_forecast = []
-        for forecast in data.get("list", [])[:8]:  # Get next 24 hours (3-hour intervals)
-            simplified_forecast.append({
-                "time": forecast["dt_txt"],
-                "temperature": forecast["main"]["temp"],
-                "weather": forecast["weather"][0]["main"],
-                "description": forecast["weather"][0]["description"],
-                "wind_speed": forecast["wind"]["speed"]
-            })
-        
-        result = {
-            "location": f"{data['city']['name']}, {data['city']['country']}",
-            "forecast": simplified_forecast
-        }
-        
-        return json.dumps(result)
-    except requests.RequestException as e:
-        print(f"Weather forecast API error: {e}")
-        return json.dumps({"error": "Failed to retrieve weather forecast"})
+        if bucket:
+            blob = bucket.blob(file_path)
+            return blob.download_as_bytes()
+        return None
+    except Exception as e:
+        print(f"Error downloading from Firebase Storage: {e}")
+        return None
 
 # AI Analysis Functions
-def analyse_image(base64_image):
-    """Analyze product image using GPT-4 Vision"""
-    response = shopper_assistant_client.chat.completions.create(
-        model="gpt-4-vision-preview",
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "You are a professional shopping assistant with expertise in identifying products from images. Analyze the provided image and perform the following tasks:"},
-                    {"type": "text", "text": "1. Identify and list all products shown in the image, including detailed descriptions."},
-                    {"type": "text", "text": "2. Recognize and include brand names where applicable."},
-                    {"type": "text", "text": "3. Describe the shape and fabric/material of each product."},
-                    {"type": "text", "text": "4. Provide associated search queries for Google Shopping that include these details to improve search accuracy."},
-                    {"type": "text", "text": "Your goal is to give a comprehensive overview of the products in the image, making it easier for users to find similar items online."},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/png;base64,{base64_image}"
-                        }
-                    }
-                ]
-            }
-        ],
-        max_tokens=300,
-    )
-    return response.choices[0].message.content
-
-def analyze_wardrobe(user_id):
-    """Analyze a user's wardrobe for insights and recommendations"""
-    wardrobe_items = get_wardrobe_items(user_id)
-    
-    if not wardrobe_items:
-        return {"message": "No wardrobe items found for analysis."}
-    
-    # Convert to dataframe for analysis
-    df = pd.DataFrame(wardrobe_items)
-    
-    # Basic analytics
-    item_count_by_type = df['item_type'].value_counts().to_dict()
-    color_distribution = df['color'].value_counts().to_dict()
-    
-    # Find missing essential items
-    essential_items = {
-        "tops": ["white t-shirt", "button-up shirt", "sweater"],
-        "bottoms": ["blue jeans", "black pants", "shorts"],
-        "outerwear": ["jacket", "coat"],
-        "footwear": ["sneakers", "formal shoes"]
-    }
-    
-    missing_essentials = {}
-    for category, items in essential_items.items():
-        category_items = df[df['item_type'] == category]['description'].tolist() if 'description' in df.columns else []
-        missing = [item for item in items if not any(item.lower() in desc.lower() for desc in category_items)]
-        if missing:
-            missing_essentials[category] = missing
-    
-    # Get AI recommendations
-    wardrobe_summary = df.to_dict(orient='records')
-    ai_recommendations = get_ai_wardrobe_recommendations(wardrobe_summary)
-    
-    analysis_result = {
-        "item_count": len(wardrobe_items),
-        "item_distribution": item_count_by_type,
-        "color_distribution": color_distribution,
-        "missing_essentials": missing_essentials,
-        "ai_recommendations": ai_recommendations
-    }
-    
-    # Save analysis to S3
-    timestamp = datetime.now().isoformat()
-    analysis_key = f"wardrobe/{user_id}/analytics/{timestamp}_analysis.json"
-    save_to_s3(analysis_result, analysis_key)
-    
-    return analysis_result
-
-def get_ai_wardrobe_recommendations(wardrobe_items):
-    """Get AI recommendations based on wardrobe items"""
+def analyze_clothing_image(image_data):
+    """Analyze clothing image using OpenAI Vision"""
     try:
-        response = shopper_assistant_client.chat.completions.create(
-            model="gpt-4",
+        base64_image = base64.b64encode(image_data).decode('utf-8')
+        
+        response = client.chat.completions.create(
+            model="gpt-4o",  # Updated to latest model
             messages=[
                 {
-                    "role": "system",
-                    "content": """You are a fashion stylist AI that provides wardrobe recommendations. 
-                    Analyze the user's wardrobe items and provide the following insights:
-                    1. Gaps in their wardrobe and what essential items they should consider adding
-                    2. Potential outfit combinations from existing items
-                    3. Style recommendations based on their current preferences
-                    4. Suggestions for versatile items that would enhance their wardrobe
-                    Be specific and practical in your recommendations."""
-                },
-                {
                     "role": "user",
-                    "content": f"Here is my wardrobe data: {json.dumps(wardrobe_items)}. Please provide your analysis and recommendations."
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": """Analyze this clothing item and provide detailed information in JSON format:
+                            {
+                                "item_type": "type of clothing (tops, bottoms, dresses, shoes, accessories)",
+                                "color": "primary color",
+                                "style": "style description",
+                                "material": "apparent material",
+                                "occasion": "suitable occasion",
+                                "season": "suitable season",
+                                "description": "detailed description",
+                                "tags": ["relevant", "tags", "for", "categorization"]
+                            }"""
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
+                        }
+                    ]
                 }
             ],
             max_tokens=500
         )
-        return response.choices[0].message.content
+        
+        content = response.choices[0].message.content
+        # Try to extract JSON from the response
+        try:
+            # Find JSON in the response
+            start = content.find('{')
+            end = content.rfind('}') + 1
+            json_str = content[start:end]
+            return json.loads(json_str)
+        except:
+            # If JSON parsing fails, return a basic structure
+            return {
+                "item_type": "unknown",
+                "color": "unknown",
+                "style": "unknown",
+                "material": "unknown",
+                "occasion": "unknown",
+                "season": "unknown",
+                "description": content,
+                "tags": []
+            }
     except Exception as e:
-        print(f"Error getting AI recommendations: {e}")
-        return "Unable to generate recommendations at this time."
+        print(f"Error analyzing image: {e}")
+        return None
 
-def get_weather_based_recommendations(user_id, location):
-    """Get outfit recommendations based on weather and user's wardrobe"""
-    # Get weather data
-    weather_data = get_weather(location)
-    
-    if "error" in weather_data:
-        return {"error": "Failed to retrieve weather data for recommendations"}
-    
-    # Get user's wardrobe
-    wardrobe_items = get_wardrobe_items(user_id)
-    
-    if not wardrobe_items:
-        return {"message": "No wardrobe items found. Please add items to get personalized recommendations."}
-    
-    # Extract weather conditions
-    temperature = weather_data.get("main", {}).get("temp")
-    weather_condition = weather_data.get("weather", [{}])[0].get("main")
-    
-    # Generate AI recommendations
+def get_ai_recommendations(user_id: str, occasion: str = "casual", weather: str = None):
+    """Get AI-powered outfit recommendations based on user's wardrobe"""
     try:
-        response = shopper_assistant_client.chat.completions.create(
+        # Get user's wardrobe items
+        wardrobe_items = query_firestore("wardrobe", [("user_id", "==", user_id)])
+        
+        if not wardrobe_items:
+            return {"message": "No wardrobe items found for recommendations"}
+        
+        # Get user preferences
+        preferences = get_from_firestore("user_preferences", user_id) or {}
+        
+        # Get recent outfit history
+        recent_outfits = query_firestore("outfit_history", [
+            ("user_id", "==", user_id),
+            ("date_worn", ">=", (datetime.now() - timedelta(days=7)).isoformat())
+        ])
+        
+        # Prepare context for AI
+        context = {
+            "wardrobe_items": wardrobe_items,
+            "preferences": preferences,
+            "recent_outfits": recent_outfits,
+            "occasion": occasion,
+            "weather": weather
+        }
+        
+        response = client.chat.completions.create(
             model="gpt-4",
             messages=[
                 {
                     "role": "system",
-                    "content": """You are a fashion and weather expert. Based on the current weather conditions 
-                    and the user's wardrobe, suggest appropriate outfits for the day. Consider temperature, 
-                    precipitation, and overall weather conditions when making your recommendations."""
+                    "content": """You are a professional fashion stylist AI. Based on the user's wardrobe, preferences, and context, provide personalized outfit recommendations. 
+                    
+                    Consider:
+                    1. Occasion appropriateness
+                    2. Weather conditions
+                    3. Color coordination
+                    4. Style consistency
+                    5. Recently worn items (avoid repetition)
+                    6. User preferences
+                    
+                    Provide 3-5 complete outfit suggestions with explanations."""
                 },
                 {
                     "role": "user",
-                    "content": f"""Current weather in {location}: 
-                    Temperature: {temperature}°C
-                    Condition: {weather_condition}
-                    
-                    My wardrobe items: {json.dumps(wardrobe_items)}
-                    
-                    Please suggest 2-3 appropriate outfits for today based on the weather and my available clothes.
-                    If I'm missing essential items for this weather, please suggest what I should consider purchasing."""
+                    "content": f"Please recommend outfits based on this data: {json.dumps(context)}"
                 }
             ],
-            max_tokens=500
+            max_tokens=800
         )
         
         recommendations = response.choices[0].message.content
         
-        result = {
-            "weather": {
-                "location": location,
-                "temperature": temperature,
-                "condition": weather_condition
-            },
-            "recommendations": recommendations
+        # Save recommendations to Firestore
+        recommendation_data = {
+            "user_id": user_id,
+            "recommendations": recommendations,
+            "occasion": occasion,
+            "weather": weather,
+            "timestamp": datetime.now().isoformat(),
+            "context": context
         }
         
-        # Save recommendations to S3
-        timestamp = datetime.now().isoformat()
-        rec_key = f"recommendations/{user_id}/weather/{timestamp}.json"
-        save_to_s3(result, rec_key)
+        rec_id = str(uuid.uuid4())
+        save_to_firestore("recommendations", rec_id, recommendation_data)
         
-        return result
-        
-    except Exception as e:
-        print(f"Error getting weather-based recommendations: {e}")
-        return {"error": "Failed to generate weather-based recommendations"}
-
-def get_products(query):
-    """Search for products using Google Shopping via SerpAPI"""
-    base_url = "https://serpapi.com/search.json"
-    params = {
-        "engine": "google_shopping",
-        "q": query,
-        "api_key": SERPAPI_API_KEY,
-        "gl": GOOGLE_SHOPPING_REGION
-    }
-
-    try:
-        response = requests.get(base_url, params=params)
-        response.raise_for_status()
-        data = response.json()
-        top_3_results = data.get("shopping_results", [])[:3]
-
-        if not top_3_results:
-            return "No products found for this query."
-
-        results_list = []
-        for result in top_3_results:
-            product_info = {
-                "title": result.get("title", "No title"),
-                "price": result.get("price", "Price not available"),
-                "link": result.get("link", "#"),
-                "image": result.get("thumbnail", "")
-            }
-            results_list.append(product_info)
-        
-        return json.dumps(results_list)
-    
-    except requests.RequestException as e:
-        print(f"Request failed: {e}")
-        return f"Failed to retrieve products: {str(e)}"
-
-def call_functions(required_actions, thread_id, run_id, user_id=None):
-    """Execute tool functions required by the assistant"""
-    tool_outputs = []
-
-    for action in required_actions["tool_calls"]:
-        func_name = action['function']['name']
-        arguments = json.loads(action['function']['arguments'])
-
-        if func_name == "search_google_shopping":
-            output = get_products(arguments['query'])
-            tool_outputs.append({
-                "tool_call_id": action['id'],
-                "output": output
-            })
-        elif func_name == "get_weather_forecast":
-            output = get_weather_forecast(arguments['location'])
-            tool_outputs.append({
-                "tool_call_id": action['id'],
-                "output": output
-            })
-        elif func_name == "get_user_wardrobe_items":
-            if user_id:
-                category = arguments.get('category', 'all')
-                items = get_wardrobe_items(user_id, category)
-                tool_outputs.append({
-                    "tool_call_id": action['id'],
-                    "output": json.dumps(items)
-                })
-            else:
-                tool_outputs.append({
-                    "tool_call_id": action['id'],
-                    "output": json.dumps({"error": "User ID not provided"})
-                })
-        else:
-            error_msg = f"Unknown function: {func_name}"
-            tool_outputs.append({
-                "tool_call_id": action['id'],
-                "output": error_msg
-            })
-
-    shopper_assistant_client.beta.threads.runs.submit_tool_outputs(
-        thread_id=thread_id,
-        run_id=run_id,
-        tool_outputs=tool_outputs
-    )
-
-# API Endpoints
-@app.post("/chat", tags=["Shopping Assistant"])
-async def chat_endpoint(chat_request: ChatMessage):
-    """
-    Chat with the shopping assistant
-    
-    - **message**: The user's message
-    - **thread_id**: Optional thread ID for continuing a conversation
-    - **user_id**: User identifier for storing chat history
-    """
-    # Get or create thread
-    thread_id = chat_request.thread_id
-    if not thread_id:
-        thread = shopper_assistant_client.beta.threads.create()
-        thread_id = thread.id
-    else:
-        # Verify thread exists
-        if thread_id not in thread_storage and not chat_request.thread_id.startswith("thread_"):
-            # Create new thread if ID doesn't exist
-            thread = shopper_assistant_client.beta.threads.create()
-            thread_id = thread.id
-
-    # Add to storage
-    thread_storage[thread_id] = thread_id
-    
-    # Save user message to S3
-    save_chat_history(chat_request.user_id, thread_id, chat_request.message, "user")
-    
-    # Add user message to thread
-    shopper_assistant_client.beta.threads.messages.create(
-        thread_id=thread_id,
-        role="user",
-        content=chat_request.message
-    )
-
-    # Run the assistant
-    run = shopper_assistant_client.beta.threads.runs.create(
-        thread_id=thread_id,
-        assistant_id=shopping_assistant.id
-    )
-
-    # Wait for completion or action requirements
-    while True:
-        time.sleep(0.5)
-        
-        # Check run status
-        run_status = shopper_assistant_client.beta.threads.runs.retrieve(
-            thread_id=thread_id,
-            run_id=run.id
-        )
-        
-        if run_status.status == 'requires_action':
-            call_functions(run_status.required_action.submit_tool_outputs.model_dump(), thread_id, run.id, chat_request.user_id)
-        
-        elif run_status.status == 'completed':
-            # Get the latest message
-            messages = shopper_assistant_client.beta.threads.messages.list(
-                thread_id=thread_id
-            )
-            
-            latest_message = messages.data[0]
-            content = latest_message.content[0].text.value
-            
-            # Save assistant response to S3
-            save_chat_history(chat_request.user_id, thread_id, content, "assistant")
-            
-            return {
-                "response": content,
-                "thread_id": thread_id
-            }
-        
-        elif run_status.status == 'failed':
-            error_message = "Assistant failed to process the request"
-            # Save error message to S3
-            save_chat_history(chat_request.user_id, thread_id, error_message, "system")
-            raise HTTPException(status_code=500, detail=error_message)
-        
-        time.sleep(1)
-
-@app.post("/analyze_product", tags=["Product Analysis"])
-async def analyze_product_endpoint(file: UploadFile = File(...), user_id: str = Form(...)):
-    """
-    Analyze a product image
-    
-    - **file**: Product image to analyze
-    - **user_id**: User identifier for storing image
-    """
-    try:
-        contents = await file.read()
-        
-        # Save image to S3
-        image_path = save_image_to_s3(user_id, contents, "product_analysis")
-        
-        # Analyze image
-        encoded_image = base64.b64encode(contents).decode('utf-8')
-        analysis = analyse_image(encoded_image)
-        
-        # Save analysis result to S3
-        analysis_data = {
-            "image_path": image_path,
-            "analysis": analysis,
+        return {
+            "recommendations": recommendations,
+            "recommendation_id": rec_id,
             "timestamp": datetime.now().isoformat()
         }
         
-        analysis_path = f"product_analysis/{user_id}/{str(uuid.uuid4())}.json"
-        save_to_s3(analysis_data, analysis_path)
+    except Exception as e:
+        print(f"Error getting AI recommendations: {e}")
+        return {"error": "Failed to generate recommendations"}
+
+def analyze_wardrobe_patterns(user_id: str):
+    """Analyze user's wardrobe usage patterns and provide insights"""
+    try:
+        # Get all wardrobe items
+        wardrobe_items = query_firestore("wardrobe", [("user_id", "==", user_id)])
+        
+        # Get outfit history
+        outfit_history = query_firestore("outfit_history", [("user_id", "==", user_id)])
+        
+        if not wardrobe_items:
+            return {"message": "No wardrobe data available for analysis"}
+        
+        # Analyze patterns
+        df = pd.DataFrame(wardrobe_items)
+        
+        analysis = {
+            "total_items": len(wardrobe_items),
+            "items_by_type": df['item_type'].value_counts().to_dict() if 'item_type' in df.columns else {},
+            "items_by_color": df['color'].value_counts().to_dict() if 'color' in df.columns else {},
+            "items_by_season": df.get('season', pd.Series()).value_counts().to_dict(),
+            "items_by_occasion": df.get('occasion', pd.Series()).value_counts().to_dict(),
+        }
+        
+        # Calculate wear frequency
+        item_wear_count = {}
+        for outfit in outfit_history:
+            for item_id in outfit.get('items', []):
+                item_wear_count[item_id] = item_wear_count.get(item_id, 0) + 1
+        
+        # Find most and least worn items
+        if item_wear_count:
+            sorted_items = sorted(item_wear_count.items(), key=lambda x: x[1], reverse=True)
+            analysis["most_worn_items"] = sorted_items[:5]
+            analysis["least_worn_items"] = sorted_items[-5:]
+        
+        # Get AI insights
+        ai_response = client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a wardrobe analytics expert. Analyze the provided wardrobe data and provide insights about usage patterns, gaps, and recommendations for optimization."
+                },
+                {
+                    "role": "user",
+                    "content": f"Analyze this wardrobe data: {json.dumps(analysis)}"
+                }
+            ],
+            max_tokens=500
+        )
+        
+        analysis["ai_insights"] = ai_response.choices[0].message.content
+        analysis["timestamp"] = datetime.now().isoformat()
+        
+        # Save analysis
+        save_to_firestore("wardrobe_analytics", f"{user_id}_{int(time.time())}", analysis)
+        
+        return analysis
+        
+    except Exception as e:
+        print(f"Error analyzing wardrobe patterns: {e}")
+        return {"error": "Failed to analyze wardrobe patterns"}
+
+def get_weather_forecast(location: str):
+    """Get weather forecast for outfit recommendations"""
+    try:
+        base_url = "https://api.openweathermap.org/data/2.5/forecast"
+        params = {
+            "q": location,
+            "appid": WEATHER_API_KEY,
+            "units": "metric"
+        }
+        
+        response = requests.get(base_url, params=params)
+        response.raise_for_status()
+        data = response.json()
+        
+        # Simplify forecast data
+        forecast = []
+        for item in data.get("list", [])[:8]:  # Next 24 hours
+            forecast.append({
+                "time": item["dt_txt"],
+                "temperature": item["main"]["temp"],
+                "weather": item["weather"][0]["main"],
+                "description": item["weather"][0]["description"]
+            })
         
         return {
+            "location": f"{data['city']['name']}, {data['city']['country']}",
+            "forecast": forecast
+        }
+    except Exception as e:
+        print(f"Weather API error: {e}")
+        return {"error": "Failed to get weather data"}
+
+def search_products(query: str):
+    """Search for products using SerpAPI"""
+    try:
+        base_url = "https://serpapi.com/search.json"
+        params = {
+            "engine": "google_shopping",
+            "q": query,
+            "api_key": SERPAPI_API_KEY,
+            "gl": "US"
+        }
+        
+        response = requests.get(base_url, params=params)
+        response.raise_for_status()
+        data = response.json()
+        
+        products = []
+        for result in data.get("shopping_results", [])[:5]:
+            products.append({
+                "title": result.get("title", ""),
+                "price": result.get("price", ""),
+                "link": result.get("link", ""),
+                "image": result.get("thumbnail", ""),
+                "source": result.get("source", "")
+            })
+        
+        return products
+    except Exception as e:
+        print(f"Product search error: {e}")
+        return []
+    
+import base64
+import tempfile
+import os
+import uuid
+from openai import OpenAI
+
+client = OpenAI()
+
+def virtual_try_on_gpt(person_image_data, garment_image_data, garment_description):
+    """Perform virtual try-on using OpenAI's image editing model"""
+    try:
+        # Create temporary files for OpenAI API
+        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as person_temp:
+            person_temp.write(person_image_data)
+            person_path = person_temp.name
+        
+        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as garment_temp:
+            garment_temp.write(garment_image_data)
+            garment_path = garment_temp.name
+        
+        try:
+            # Use your original prompt logic
+            prompt = """
+Generate a photorealistic image of a person using that dress on image 
+containing all the items in the reference pictures.
+"""
+            
+            # Use your original OpenAI API call logic
+            result = client.images.edit(
+                model="gpt-image-1",
+                image=[
+                    open(person_path, "rb"),
+                    open(garment_path, "rb"),
+                ],
+                prompt=prompt
+            )
+            
+            # Use your original image processing logic
+            image_base64 = result.data[0].b64_json
+            image_bytes = base64.b64decode(image_base64)
+            
+            # Save the image to a file (keeping your original save logic)
+            output_filename = "gift-basket.png"
+            with open(output_filename, "wb") as f:
+                f.write(image_bytes)
+            
+            # Clean up temporary files
+            os.unlink(person_path)
+            os.unlink(garment_path)
+            
+            return {
+                "result_file": output_filename,
+                "result_base64": image_base64,
+                "status": "success"
+            }
+            
+        except Exception as api_error:
+            # Clean up temporary files on error
+            try:
+                os.unlink(person_path)
+                os.unlink(garment_path)
+            except:
+                pass
+            
+            print(f"OpenAI API error: {api_error}")
+            return {
+                "error": "Virtual try-on service failed",
+                "details": str(api_error),
+                "status": "api_error"
+            }
+        
+    except Exception as e:
+        print(f"Virtual try-on error: {e}")
+        return {"error": "Virtual try-on failed", "details": str(e)}
+
+
+# API Endpoints
+
+@app.post("/chat", tags=["AI Assistant"])
+async def chat_with_assistant(chat_request: ChatMessage):
+    """Chat with the AI shopping assistant"""
+    try:
+        # Get user context
+        user_data = get_from_firestore("users", chat_request.user_id) or {}
+        wardrobe_items = query_firestore("wardrobe", [("user_id", "==", chat_request.user_id)])
+        preferences = get_from_firestore("user_preferences", chat_request.user_id) or {}
+        
+        # Create context-aware system message
+        system_message = f"""You are a personal fashion and shopping assistant. You have access to the user's wardrobe data and preferences.
+        
+        User's wardrobe: {json.dumps(wardrobe_items[:10])}  # Limit to avoid token limits
+        User's preferences: {json.dumps(preferences)}
+        
+        Provide helpful fashion advice, outfit suggestions, shopping recommendations, and style guidance based on their existing wardrobe and preferences."""
+        
+        response = client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": chat_request.message}
+            ],
+            max_tokens=500
+        )
+        
+        assistant_response = response.choices[0].message.content
+        
+        # Save chat history
+        chat_data = {
+            "user_id": chat_request.user_id,
+            "thread_id": chat_request.thread_id or str(uuid.uuid4()),
+            "message": chat_request.message,
+            "response": assistant_response,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        chat_id = str(uuid.uuid4())
+        save_to_firestore("chat_history", chat_id, chat_data)
+        
+        return {
+            "response": assistant_response,
+            "thread_id": chat_data["thread_id"],
+            "timestamp": chat_data["timestamp"]
+        }
+        
+    except Exception as e:
+        print(f"Chat error: {e}")
+        raise HTTPException(status_code=500, detail="Chat service failed")
+
+@app.post("/wardrobe/upload", tags=["Wardrobe Management"])
+async def upload_wardrobe_item(
+    file: UploadFile = File(...),
+    user_id: str = Form(...),
+    manual_data: Optional[str] = Form(None)
+):
+    """Upload and categorize a wardrobe item with automatic image recognition"""
+    try:
+        # Read image data
+        image_data = await file.read()
+        
+        # Analyze image with AI
+        analysis = analyze_clothing_image(image_data)
+        
+        if not analysis:
+            raise HTTPException(status_code=500, detail="Image analysis failed")
+        
+        # Merge with manual data if provided
+        if manual_data:
+            try:
+                manual_info = json.loads(manual_data)
+                analysis.update(manual_info)
+            except json.JSONDecodeError:
+                pass
+        
+        # Generate unique item ID
+        item_id = str(uuid.uuid4())
+        
+        # Upload image to Firebase Storage
+        image_path = f"wardrobe/{user_id}/{item_id}.jpg"
+        image_url = upload_to_firebase_storage(image_data, image_path)
+        
+        # Prepare wardrobe item data
+        wardrobe_item = {
+            "item_id": item_id,
+            "user_id": user_id,
+            "image_url": image_url,
+            "upload_date": datetime.now().isoformat(),
+            **analysis
+        }
+        
+        # Save to Firestore
+        save_to_firestore("wardrobe", item_id, wardrobe_item)
+        
+        return {
+            "message": "Wardrobe item uploaded successfully",
+            "item_id": item_id,
             "analysis": analysis,
-            "image_path": image_path
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error analyzing image: {str(e)}")
-
-@app.post("/try_on", tags=["Virtual Try-On"])
-async def try_on_endpoint(
-    garment_img: UploadFile = File(...),
-    person_img: UploadFile = File(...),
-    params: TryOnRequest = Body(...)
-):
-    """
-    Virtual try-on simulation
-    
-    - **garment_img**: Image of the garment
-    - **person_img**: Image of the person
-    - **params**: Contains garment_type, sleeve_length, garment_length, user_id
-    """
-    try:
-        # Read the uploaded images
-        garment_contents = await garment_img.read()
-        person_contents = await person_img.read()
-        
-        # Save images to S3
-        garment_path = save_image_to_s3(params.user_id, garment_contents, "try_on_garment")
-        person_path = save_image_to_s3(params.user_id, person_contents, "try_on_person")
-        
-        # In a real implementation, you would call the try-on service here
-        # For this example, we'll simulate a response
-        
-        # Simulate processing delay
-        time.sleep(2)
-        
-        result = {
-            "success": True,
-            "message": "Virtual try-on processed successfully",
-            "details": {
-                "garment_type": params.garment_type,
-                "sleeve_length": params.sleeve_length,
-                "garment_length": params.garment_length,
-                "garment_file": garment_img.filename,
-                "person_file": person_img.filename,
-            },
-            # In a real implementation, you might return a base64 image or URL to the resulting image
-            "result_url": "https://example.com/result_image.jpg",
-            "garment_path": garment_path,
-            "person_path": person_path
+            "image_url": image_url
         }
         
-        # Save result to S3
-        result_path = f"try_on_results/{params.user_id}/{str(uuid.uuid4())}.json"
-        save_to_s3(result, result_path)
-        
-        return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing try-on: {str(e)}")
+        print(f"Upload error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to upload wardrobe item")
 
-@app.post("/wardrobe/add_item", tags=["Wardrobe Management"])
-async def add_wardrobe_item_endpoint(
-    item: WardrobeItem = Body(...),
-    image: Optional[UploadFile] = File(None),
-    user_id: str = Form(...)
-):
-    """
-    Add an item to the user's digital wardrobe
-    
-    - **item**: Wardrobe item details
-    - **image**: Optional image of the item
-    - **user_id**: User identifier
-    """
+@app.get("/wardrobe/{user_id}", tags=["Wardrobe Management"])
+async def get_user_wardrobe(user_id: str, category: Optional[str] = None):
+    """Get user's wardrobe items, optionally filtered by category"""
     try:
-        # Process image if provided
-        image_data = None
-        if image:
-            image_data = await image.read()
+        filters = [("user_id", "==", user_id)]
+        if category:
+            filters.append(("item_type", "==", category))
         
-        # Convert item to dict and add user_id
-        item_dict = item.dict()
-        item_dict["user_id"] = user_id
-        
-        # Save to S3
-        result = save_wardrobe_item(user_id, item_dict, image_data)
-        
-        return {
-            "message": "Item added to wardrobe successfully",
-            "item_id": result["item_id"]
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error adding wardrobe item: {str(e)}")
-
-@app.get("/wardrobe/items/{user_id}", tags=["Wardrobe Management"])
-async def get_wardrobe_items_endpoint(user_id: str, category: str = "all"):
-    """
-    Get wardrobe items for a user
-    
-    - **user_id**: User identifier
-    - **category**: Optional category filter
-    """
-    try:
-        items = get_wardrobe_items(user_id, category)
+        items = query_firestore("wardrobe", filters)
         
         return {
             "user_id": user_id,
@@ -810,229 +629,540 @@ async def get_wardrobe_items_endpoint(user_id: str, category: str = "all"):
             "items_count": len(items),
             "items": items
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error retrieving wardrobe items: {str(e)}")
-
-@app.get("/wardrobe/analytics/{user_id}", tags=["Wardrobe Analytics"])
-async def wardrobe_analytics_endpoint(user_id: str):
-    """
-    Get analytics for a user's wardrobe
-    
-    - **user_id**: User identifier
-    """
-    try:
-        analysis = analyze_wardrobe(user_id)
         
-        return analysis
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error analyzing wardrobe: {str(e)}")
+        print(f"Get wardrobe error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve wardrobe")
 
-@app.post("/set_user_location", tags=["Weather Integration"])
-async def set_user_location_endpoint(location_data: UserLocation):
-    """
-    Set a user's location for weather-based recommendations
-    
-    - **user_id**: User identifier
-    - **location**: City name or location
-    """
+@app.post("/recommendations", tags=["AI Recommendations"])
+async def get_outfit_recommendations(
+    user_id: str = Body(...),
+    occasion: str = Body("casual"),
+    location: Optional[str] = Body(None)
+):
+    """Get AI-powered outfit recommendations"""
     try:
-        # Save user location to S3
-        location_key = f"user_data/{location_data.user_id}/location.json"
-        save_to_s3(location_data.dict(), location_key)
+        weather_data = None
+        if location:
+            weather_data = get_weather_forecast(location)
         
-        # Get current weather as confirmation
-        weather = get_weather(location_data.location)
+        recommendations = get_ai_recommendations(
+            user_id=user_id,
+            occasion=occasion,
+            weather=weather_data
+        )
+        
+        return recommendations
+        
+    except Exception as e:
+        print(f"Recommendations error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to generate recommendations")
+
+@app.post("/outfit/plan", tags=["Outfit Planning"])
+async def create_outfit_plan(
+    user_id: str = Body(...),
+    outfit_name: str = Body(...),
+    occasion: str = Body(...),
+    item_ids: List[str] = Body(...),
+    date_planned: Optional[str] = Body(None)
+):
+    """Create and save an outfit plan"""
+    try:
+        outfit_plan = {
+            "plan_id": str(uuid.uuid4()),
+            "user_id": user_id,
+            "name": outfit_name,
+            "occasion": occasion,
+            "items": item_ids,
+            "date_planned": date_planned,
+            "created_date": datetime.now().isoformat()
+        }
+        
+        save_to_firestore("outfit_plans", outfit_plan["plan_id"], outfit_plan)
         
         return {
-            "message": f"Location set to {location_data.location}",
-            "current_weather": weather
+            "message": "Outfit plan created successfully",
+            "plan_id": outfit_plan["plan_id"],
+            "outfit_plan": outfit_plan
         }
+        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error setting user location: {str(e)}")
+        print(f"Outfit planning error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to create outfit plan")
 
-@app.get("/weather_recommendations/{user_id}", tags=["Weather Integration"])
-async def weather_recommendations_endpoint(user_id: str, location: Optional[str] = None):
-    """
-    Get outfit recommendations based on weather and user's wardrobe
-    
-    - **user_id**: User identifier
-    - **location**: Optional location override
-    """
+@app.get("/outfit/plans/{user_id}", tags=["Outfit Planning"])
+async def get_outfit_plans(user_id: str):
+    """Get user's saved outfit plans"""
     try:
-        # Get user's saved location if not provided
-        if not location:
-            location_key = f"user_data/{user_id}/location.json"
-            location_data = get_from_s3(location_key)
-            
-            if location_data:
-                location_json = json.loads(location_data)
-                location = location_json.get("location")
-            else:
-                raise HTTPException(status_code=400, detail="No location provided or saved for user")
-        
-        recommendations = get_weather_based_recommendations(user_id, location)
-        return recommendations
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error getting weather recommendations: {str(e)}")
-
-@app.get("/chat_history/{user_id}", tags=["Chat History"])
-async def get_chat_history_endpoint(
-    user_id: str, 
-    thread_id: Optional[str] = None,
-    limit: int = 50,
-    skip: int = 0
-):
-    """
-    Get chat history for a user
-    
-    - **user_id**: User identifier
-    - **thread_id**: Optional thread ID to filter by
-    - **limit**: Maximum number of messages to return
-    - **skip**: Number of messages to skip
-    """
-    try:
-        # Define the prefix based on whether thread_id is provided
-        prefix = f"chats/{user_id}/"
-        if thread_id:
-            prefix = f"chats/{user_id}/{thread_id}/"
-        
-        # List all chat objects
-        chat_keys = list_s3_objects(prefix)
-        
-        # Sort by timestamp (assuming timestamp is part of the key)
-        chat_keys.sort(reverse=True)
-        
-        # Apply pagination
-        paginated_keys = chat_keys[skip:skip+limit]
-        
-        # Fetch the chat messages
-        messages = []
-        for key in paginated_keys:
-            chat_data = get_from_s3(key)
-            if chat_data:
-                messages.append(json.loads(chat_data))
+        plans = query_firestore("outfit_plans", [("user_id", "==", user_id)])
         
         return {
             "user_id": user_id,
-            "thread_id": thread_id,
-            "total_messages": len(chat_keys),
-            "messages": messages
+            "plans_count": len(plans),
+            "plans": plans
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error retrieving chat history: {str(e)}")
-
-@app.delete("/wardrobe/items/{user_id}/{item_id}", tags=["Wardrobe Management"])
-async def delete_wardrobe_item_endpoint(user_id: str, item_id: str):
-    """
-    Delete an item from the user's wardrobe
-    
-    - **user_id**: User identifier
-    - **item_id**: Item identifier
-    """
-    try:
-        # Delete item data
-        data_key = f"wardrobe/{user_id}/items/{item_id}.json"
-        s3_client.delete_object(Bucket=S3_BUCKET_NAME, Key=data_key)
         
-        # Delete item image if it exists
-        image_key = f"wardrobe/{user_id}/images/{item_id}.jpg"
-        s3_client.delete_object(Bucket=S3_BUCKET_NAME, Key=image_key)
+    except Exception as e:
+        print(f"Get outfit plans error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve outfit plans")
+
+
+@app.post("/try-on", tags=["Virtual Try-On"])
+async def virtual_try_on_endpoint(
+    person_image: UploadFile = File(...),
+    garment_image: UploadFile = File(...),
+    user_id: str = Form(...),
+    garment_description: str = Form(...)
+):
+    """Perform virtual try-on using OpenAI's image editing model"""
+    try:
+        person_data = await person_image.read()
+        garment_data = await garment_image.read()
+        
+        # Perform virtual try-on with GPT
+        result = virtual_try_on_gpt(person_data, garment_data, garment_description)
+        
+        if "error" in result:
+            raise HTTPException(status_code=500, detail=result["error"])
+        
+        # Save try-on result to Firestore
+        tryon_data = {
+            "tryon_id": str(uuid.uuid4()),
+            "user_id": user_id,
+            "garment_description": garment_description,
+            "timestamp": datetime.now().isoformat(),
+            "result_url": result["result_url"],
+            "status": result["status"]
+        }
+        
+        save_to_firestore("tryon_results", tryon_data["tryon_id"], tryon_data)
         
         return {
-            "message": f"Item {item_id} deleted successfully"
+            "message": "Virtual try-on completed successfully",
+            "tryon_id": tryon_data["tryon_id"],
+            "result_url": result["result_url"],
+            "result_base64": result.get("result_base64")
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error deleting wardrobe item: {str(e)}")
-
-@app.get("/export_wardrobe/{user_id}", tags=["Wardrobe Management"])
-async def export_wardrobe_endpoint(user_id: str, format: str = "json"):
-    """
-    Export a user's wardrobe data
-    
-    - **user_id**: User identifier
-    - **format**: Export format (json or csv)
-    """
-    try:
-        items = get_wardrobe_items(user_id)
         
-        if format.lower() == "csv":
-            # Convert to pandas DataFrame and then to CSV
-            df = pd.DataFrame(items)
-            csv_data = df.to_csv(index=False)
-            
-            # Save to S3
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            export_key = f"exports/{user_id}/wardrobe_{timestamp}.csv"
-            save_to_s3(csv_data, export_key, "text/csv")
-            
-            return {
-                "message": "Wardrobe exported as CSV",
-                "export_path": export_key,
-                "download_url": f"https://{S3_BUCKET_NAME}.s3.amazonaws.com/{export_key}"
-            }
-        else:
-            # Save as JSON
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            export_key = f"exports/{user_id}/wardrobe_{timestamp}.json"
-            save_to_s3(items, export_key)
-            
-            return {
-                "message": "Wardrobe exported as JSON",
-                "export_path": export_key,
-                "download_url": f"https://{S3_BUCKET_NAME}.s3.amazonaws.com/{export_key}"
-            }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error exporting wardrobe: {str(e)}")
+        print(f"Virtual try-on endpoint error: {e}")
+        raise HTTPException(status_code=500, detail="Virtual try-on failed")
 
-@app.get("/health", tags=["Health Check"])
+@app.get("/analytics/{user_id}", tags=["Wardrobe Analytics"])
+async def get_wardrobe_analytics(user_id: str):
+    """Get comprehensive wardrobe analytics and insights"""
+    try:
+        analytics = analyze_wardrobe_patterns(user_id)
+        return analytics
+        
+    except Exception as e:
+        print(f"Analytics error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to generate analytics")
+
+@app.post("/shopping/search", tags=["E-commerce Integration"])
+async def search_products_endpoint(
+    query: str = Body(...),
+    user_id: str = Body(...)
+):
+    """Search for products and get shopping suggestions"""
+    try:
+        products = search_products(query)
+        
+        # Save search history
+        search_data = {
+            "search_id": str(uuid.uuid4()),
+            "user_id": user_id,
+            "query": query,
+            "results": products,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        save_to_firestore("search_history", search_data["search_id"], search_data)
+        
+        return {
+            "query": query,
+            "results_count": len(products),
+            "products": products
+        }
+        
+    except Exception as e:
+        print(f"Product search error: {e}")
+        raise HTTPException(status_code=500, detail="Product search failed")
+
+@app.post("/preferences", tags=["User Management"])
+async def update_user_preferences(
+    user_id: str = Body(...),
+    preferences: UserPreferences = Body(...)
+):
+    """Update user's style preferences"""
+    try:
+        pref_data = preferences.dict()
+        pref_data["user_id"] = user_id
+        pref_data["updated_date"] = datetime.now().isoformat()
+        
+        save_to_firestore("user_preferences", user_id, pref_data)
+        
+        return {
+            "message": "Preferences updated successfully",
+            "preferences": pref_data
+        }
+        
+    except Exception as e:
+        print(f"Preferences update error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to update preferences")
+
+@app.get("/preferences/{user_id}", tags=["User Management"])
+async def get_user_preferences(user_id: str):
+    """Get user's style preferences"""
+    try:
+        preferences = get_from_firestore("user_preferences", user_id)
+        
+        if not preferences:
+            return {"message": "No preferences found", "preferences": {}}
+        
+        return {"preferences": preferences}
+        
+    except Exception as e:
+        print(f"Get preferences error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve preferences")
+
+@app.post("/outfit/worn", tags=["Usage Tracking"])
+async def record_outfit_worn(
+    user_id: str = Body(...),
+    item_ids: List[str] = Body(...),
+    occasion: str = Body(...),
+    date_worn: Optional[str] = Body(None)
+):
+    """Record when an outfit was worn for analytics"""
+    try:
+        if not date_worn:
+            date_worn = datetime.now().isoformat()
+        
+        outfit_record = {
+            "record_id": str(uuid.uuid4()),
+            "user_id": user_id,
+            "items": item_ids,
+            "occasion": occasion,
+            "date_worn": date_worn,
+            "recorded_date": datetime.now().isoformat()
+        }
+        
+        save_to_firestore("outfit_history", outfit_record["record_id"], outfit_record)
+        
+        return {
+            "message": "Outfit wear recorded successfully",
+            "record_id": outfit_record["record_id"]
+        }
+        
+    except Exception as e:
+        print(f"Record outfit error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to record outfit")
+
+@app.delete("/wardrobe/{item_id}", tags=["Wardrobe Management"])
+async def delete_wardrobe_item(item_id: str, user_id: str = Query(...)):
+    """Delete a wardrobe item"""
+    try:
+        # Verify item belongs to user
+        item = get_from_firestore("wardrobe", item_id)
+        
+        if not item or item.get("user_id") != user_id:
+            raise HTTPException(status_code=404, detail="Item not found or access denied")
+        
+        # Delete from Firestore
+        if db:
+            db.collection("wardrobe").document(item_id).delete()
+        
+        # Delete image from storage if exists
+        if item.get("image_url"):
+            try:
+                image_path = f"wardrobe/{user_id}/{item_id}.jpg"
+                blob = bucket.blob(image_path)
+                blob.delete()
+            except:
+                pass  # Image deletion is not critical
+        
+        return {"message": "Wardrobe item deleted successfully"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Delete item error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to delete item")
+
+@app.get("/weather/{location}", tags=["Weather Integration"])
+async def get_weather_for_outfit(location: str):
+    """Get weather information for outfit planning"""
+    try:
+        weather_data = get_weather_forecast(location)
+        
+        if "error" in weather_data:
+            raise HTTPException(status_code=500, detail=weather_data["error"])
+        
+        return weather_data
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Weather endpoint error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get weather data")
+
+@app.get("/dashboard/{user_id}", tags=["Dashboard"])
+async def get_user_dashboard(user_id: str):
+    """Get comprehensive dashboard data for user"""
+    try:
+        # Get all user data
+        wardrobe_items = query_firestore("wardrobe", [("user_id", "==", user_id)])
+        recent_outfits = query_firestore("outfit_history", [
+            ("user_id", "==", user_id),
+            ("date_worn", ">=", (datetime.now() - timedelta(days=30)).isoformat())
+        ])
+        outfit_plans = query_firestore("outfit_plans", [("user_id", "==", user_id)])
+        preferences = get_from_firestore("user_preferences", user_id) or {}
+        
+        # Calculate basic stats
+        stats = {
+            "total_items": len(wardrobe_items),
+            "recent_wears": len(recent_outfits),
+            "saved_plans": len(outfit_plans),
+            "favorite_colors": {},
+            "most_worn_type": {},
+            "wardrobe_value": 0
+        }
+        
+        # Calculate wardrobe insights
+        if wardrobe_items:
+            colors = [item.get('color', 'unknown') for item in wardrobe_items]
+            types = [item.get('item_type', 'unknown') for item in wardrobe_items]
+            
+            stats["favorite_colors"] = {color: colors.count(color) for color in set(colors)}
+            stats["most_worn_type"] = {type_: types.count(type_) for type_ in set(types)}
+            stats["wardrobe_value"] = sum(item.get('price', 0) for item in wardrobe_items if item.get('price'))
+        
+        return {
+            "user_id": user_id,
+            "stats": stats,
+            "recent_activity": recent_outfits[-5:] if recent_outfits else [],
+            "wardrobe_preview": wardrobe_items[:10],
+            "preferences": preferences,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        print(f"Dashboard error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to load dashboard data")
+
+@app.get("/items/{item_id}", tags=["Item Details"])
+async def get_item_details(item_id: str, user_id: str = Query(...)):
+    """Get detailed information about a specific wardrobe item"""
+    try:
+        item = get_from_firestore("wardrobe", item_id)
+        
+        if not item or item.get("user_id") != user_id:
+            raise HTTPException(status_code=404, detail="Item not found or access denied")
+        
+        # Get wear history for this item
+        wear_history = query_firestore("outfit_history", [
+            ("user_id", "==", user_id),
+            ("items", "array_contains", item_id)
+        ])
+        
+        # Calculate usage stats
+        item["wear_count"] = len(wear_history)
+        item["last_worn"] = max([outfit["date_worn"] for outfit in wear_history]) if wear_history else None
+        item["wear_history"] = wear_history
+        
+        return item
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Item details error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get item details")
+
+@app.put("/wardrobe/{item_id}", tags=["Wardrobe Management"])
+async def update_wardrobe_item(
+    item_id: str,
+    user_id: str = Body(...),
+    updates: Dict[str, Any] = Body(...)
+):
+    """Update a wardrobe item's information"""
+    try:
+        # Verify item belongs to user
+        item = get_from_firestore("wardrobe", item_id)
+        
+        if not item or item.get("user_id") != user_id:
+            raise HTTPException(status_code=404, detail="Item not found or access denied")
+        
+        # Update the item
+        updates["updated_date"] = datetime.now().isoformat()
+        save_to_firestore("wardrobe", item_id, updates)
+        
+        # Get updated item
+        updated_item = get_from_firestore("wardrobe", item_id)
+        
+        return {
+            "message": "Item updated successfully",
+            "item": updated_item
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Update item error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to update item")
+
+@app.get("/export/{user_id}", tags=["Data Export"])
+async def export_user_data(user_id: str, format: str = Query("json")):
+    """Export user's wardrobe and outfit data"""
+    try:
+        # Get all user data
+        wardrobe_items = query_firestore("wardrobe", [("user_id", "==", user_id)])
+        outfit_history = query_firestore("outfit_history", [("user_id", "==", user_id)])
+        outfit_plans = query_firestore("outfit_plans", [("user_id", "==", user_id)])
+        preferences = get_from_firestore("user_preferences", user_id) or {}
+        
+        export_data = {
+            "user_id": user_id,
+            "export_date": datetime.now().isoformat(),
+            "wardrobe_items": wardrobe_items,
+            "outfit_history": outfit_history,
+            "outfit_plans": outfit_plans,
+            "preferences": preferences,
+            "summary": {
+                "total_items": len(wardrobe_items),
+                "total_outfits_worn": len(outfit_history),
+                "total_plans": len(outfit_plans)
+            }
+        }
+        
+        return export_data
+        
+    except Exception as e:
+        print(f"Export error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to export data")
+
+@app.post("/import/{user_id}", tags=["Data Import"])
+async def import_user_data(
+    user_id: str,
+    data: Dict[str, Any] = Body(...)
+):
+    """Import wardrobe and outfit data for a user"""
+    try:
+        imported_count = {
+            "wardrobe_items": 0,
+            "outfit_plans": 0,
+            "preferences": 0
+        }
+        
+        # Import wardrobe items
+        if "wardrobe_items" in data:
+            for item in data["wardrobe_items"]:
+                item["user_id"] = user_id
+                item["import_date"] = datetime.now().isoformat()
+                item_id = item.get("item_id", str(uuid.uuid4()))
+                save_to_firestore("wardrobe", item_id, item)
+                imported_count["wardrobe_items"] += 1
+        
+        # Import outfit plans
+        if "outfit_plans" in data:
+            for plan in data["outfit_plans"]:
+                plan["user_id"] = user_id
+                plan["import_date"] = datetime.now().isoformat()
+                plan_id = plan.get("plan_id", str(uuid.uuid4()))
+                save_to_firestore("outfit_plans", plan_id, plan)
+                imported_count["outfit_plans"] += 1
+        
+        # Import preferences
+        if "preferences" in data:
+            preferences = data["preferences"]
+            preferences["user_id"] = user_id
+            preferences["import_date"] = datetime.now().isoformat()
+            save_to_firestore("user_preferences", user_id, preferences)
+            imported_count["preferences"] = 1
+        
+        return {
+            "message": "Data imported successfully",
+            "imported_count": imported_count,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        print(f"Import error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to import data")
+
+@app.get("/health", tags=["System"])
 async def health_check():
-    """
-    Health check endpoint
-    """
-    # Check if we can connect to S3
+    """Health check endpoint"""
     try:
-        s3_client.list_buckets()
-        s3_status = "healthy"
-    except Exception:
-        s3_status = "unhealthy"
-    
-    # Check if we can connect to OpenAI API
-    try:
-        shopper_assistant_client.models.list()
-        openai_status = "healthy"
-    except Exception:
-        openai_status = "unhealthy"
-    
+        # Check Firebase connection
+        firebase_status = "connected" if db else "disconnected"
+        
+        # Check OpenAI API
+        openai_status = "connected" if OPENAI_API_KEY else "not configured"
+        
+        return {
+            "status": "healthy",
+            "timestamp": datetime.now().isoformat(),
+            "services": {
+                "firebase": firebase_status,
+                "openai": openai_status,
+                "weather_api": "configured" if WEATHER_API_KEY else "not configured",
+                "serp_api": "configured" if SERPAPI_API_KEY else "not configured",
+                "virtual_tryon": "available" if tryon_client else "unavailable"
+            }
+        }
+        
+    except Exception as e:
+        return {
+            "status": "unhealthy",
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }
+
+@app.get("/", tags=["System"])
+async def root():
+    """Root endpoint with API information"""
     return {
-        "status": "ok",
-        "services": {
-            "s3": s3_status,
-            "openai": openai_status
+        "name": "Enhanced Shopping Assistant API",
+        "version": "1.0.0",
+        "description": "Complete shopping assistant with Firebase integration, virtual try-on, and AI recommendations",
+        "endpoints": {
+            "docs": "/docs",
+            "redoc": "/redoc",
+            "health": "/health"
         },
-        "timestamp": datetime.now().isoformat()
+        "features": [
+            "AI-powered wardrobe analysis",
+            "Personalized outfit recommendations",
+            "Virtual try-on capabilities",
+            "Weather-based suggestions",
+            "Shopping integration",
+            "Usage analytics",
+            "Outfit planning"
+        ]
     }
 
+# Error handlers
+@app.exception_handler(404)
+async def not_found_handler(request, exc):
+    return JSONResponse(
+        status_code=404,
+        content={"message": "Endpoint not found", "detail": str(exc)}
+    )
+
+@app.exception_handler(500)
+async def internal_error_handler(request, exc):
+    return JSONResponse(
+        status_code=500,
+        content={"message": "Internal server error", "detail": str(exc)}
+    )
+
+# Run the application
 if __name__ == "__main__":
-    # Check if required environment variables are set
-    missing_vars = []
-    
-    if not OPENAI_API_KEY:
-        missing_vars.append("OPENAI_API_KEY")
-    if not SERPAPI_API_KEY:
-        missing_vars.append("SERPAPI_API_KEY")
-    if not AWS_ACCESS_KEY_ID:
-        missing_vars.append("AWS_ACCESS_KEY_ID")
-    if not AWS_SECRET_ACCESS_KEY:
-        missing_vars.append("AWS_SECRET_ACCESS_KEY")
-    if not S3_BUCKET_NAME:
-        missing_vars.append("S3_BUCKET_NAME")
-    if not WEATHER_API_KEY:
-        missing_vars.append("WEATHER_API_KEY")
-    
-    if missing_vars:
-        print(f"Error: The following environment variables are not set: {', '.join(missing_vars)}")
-        print("Please set these variables in your .env file or environment.")
-        exit(1)
-        
-    print(f"Starting Enhanced Shopping Assistant API on port 8000...")
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+        log_level="info"
+    )
